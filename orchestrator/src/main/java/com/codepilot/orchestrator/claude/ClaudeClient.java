@@ -9,6 +9,7 @@ import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.net.http.HttpTimeoutException;
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
@@ -132,7 +133,7 @@ public class ClaudeClient {
             // 2. Build the HTTP request with the required headers
             HttpRequest request = HttpRequest.newBuilder()
                     .uri(URI.create(API_URL))
-                    .timeout(Duration.ofSeconds(60))
+                    .timeout(Duration.ofSeconds(300))
                     .header("content-type",      "application/json")
                     .header("x-api-key",          apiKey)
                     .header("anthropic-version",  API_VER)
@@ -154,8 +155,13 @@ public class ClaudeClient {
 
         } catch (ClaudeApiException e) {
             throw e;
+        } catch (HttpTimeoutException e) {
+            // Surface timeouts as a typed, classified exception so AgentLoop
+            // can decide whether to retry rather than failing the step immediately.
+            throw new ClaudeApiException("Request timed out after 300 s: " + e.getMessage(),
+                    ClaudeApiException.ErrorKind.TRANSIENT_TIMEOUT);
         } catch (Exception e) {
-            throw new RuntimeException("Claude API call failed", e);
+            throw new RuntimeException("Claude API call failed: " + e.getMessage(), e);
         }
     }
 
@@ -164,11 +170,46 @@ public class ClaudeClient {
     // -------------------------------------------------------------------------
 
     public static class ClaudeApiException extends RuntimeException {
-        private final int statusCode;
+
+        /**
+         * Classifies how AgentLoop should react to this exception.
+         *
+         *  PERMANENT        — retrying will never help (bad key, no credits, bad request).
+         *                     Fail the step immediately and skip further retry attempts.
+         *  TRANSIENT_BACKOFF — server-side overload or rate-limit; back off, then retry.
+         *  TRANSIENT_TIMEOUT — HTTP request timed out; may retry once before giving up.
+         */
+        public enum ErrorKind { PERMANENT, TRANSIENT_BACKOFF, TRANSIENT_TIMEOUT }
+
+        private final int       statusCode;
+        private final ErrorKind kind;
+
+        /** Used for real HTTP error responses (non-200). Kind is derived from status. */
         public ClaudeApiException(int statusCode, String body) {
             super("Claude API error %d: %s".formatted(statusCode, body));
             this.statusCode = statusCode;
+            this.kind       = classify(statusCode);
         }
-        public int statusCode() { return statusCode; }
+
+        /** Used internally for network-level errors (e.g. timeout) with no HTTP status. */
+        ClaudeApiException(String message, ErrorKind kind) {
+            super(message);
+            this.statusCode = 0;
+            this.kind       = kind;
+        }
+
+        public int       statusCode() { return statusCode; }
+        public ErrorKind errorKind()  { return kind; }
+
+        private static ErrorKind classify(int status) {
+            return switch (status) {
+                // These will never succeed on retry without human intervention.
+                case 400, 401, 402, 403 -> ErrorKind.PERMANENT;
+                // Server-side transient: rate-limited or overloaded — back off and retry.
+                case 429, 500, 503, 529 -> ErrorKind.TRANSIENT_BACKOFF;
+                // Unknown non-200: treat as permanent (safer than infinite retries).
+                default                 -> ErrorKind.PERMANENT;
+            };
+        }
     }
 }

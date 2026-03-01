@@ -190,16 +190,17 @@ class JobServiceTest {
     }
 
     @Test
-    void completeStep_reviewer_jobMarkedDone() {
-        Step step = stepForRole(AgentRole.REVIEWER);
+    void completeStep_finalizer_jobMarkedDone() {
+        // FINALIZER is the last pipeline step — completing it must mark the job DONE.
+        Step step = stepForRole(AgentRole.FINALIZER);
         Job job   = jobWithId();
         when(jobRepo.findById(any())).thenReturn(Optional.of(job));
         when(stepRepo.save(any())).thenReturn(step);
 
-        service.completeStep(step, "{\"approved\": true}");
+        service.completeStep(step, "{\"summary\": \"done\"}");
 
-        // No new step should be created after the last role
-        verify(stepRepo, times(1)).save(any());  // only the REVIEWER step itself
+        // No new step should be created after the final role
+        verify(stepRepo, times(1)).save(any());  // only the FINALIZER step itself
         // Job must be DONE
         assertThat(job.getState()).isEqualTo(JobState.DONE);
         // Workspace must be cleaned up
@@ -222,27 +223,27 @@ class JobServiceTest {
     @Test
     void completeStep_workspaceDeleteFails_jobStillMarkedDone() {
         // A broken executor must never roll back the DB state
-        Step step = stepForRole(AgentRole.REVIEWER);
+        Step step = stepForRole(AgentRole.FINALIZER);
         Job job   = jobWithId();
         when(jobRepo.findById(any())).thenReturn(Optional.of(job));
         when(stepRepo.save(any())).thenReturn(step);
         doThrow(new com.codepilot.orchestrator.executor.ExecutorException("network error", null))
                 .when(workspaceClient).deleteWorkspace(any());
 
-        service.completeStep(step, "{\"approved\": true}");
+        service.completeStep(step, "{\"summary\": \"done\"}");
 
         // Job must still be DONE despite the cleanup failure
         assertThat(job.getState()).isEqualTo(JobState.DONE);
     }
 
     @Test
-    void completeStep_reviewer_incrementsCompletedCounter() {
-        Step step = stepForRole(AgentRole.REVIEWER);
+    void completeStep_finalizer_incrementsCompletedCounter() {
+        Step step = stepForRole(AgentRole.FINALIZER);
         Job job   = jobWithId();
         when(jobRepo.findById(any())).thenReturn(Optional.of(job));
         when(stepRepo.save(any())).thenReturn(step);
 
-        service.completeStep(step, "{\"approved\": true}");
+        service.completeStep(step, "{\"summary\": \"done\"}");
 
         assertThat(meterRegistry.counter("codepilot.jobs.completed").count()).isEqualTo(1.0);
     }
@@ -273,6 +274,46 @@ class JobServiceTest {
                 .isEqualTo(1.0);
         assertThat(meterRegistry.counter("codepilot.jobs.failed", "reason", "max_retries").count())
                 .isEqualTo(1.0);
+    }
+
+    // ------------------------------------------------------------------
+    // failStep(permanent=true) — skip-retry path for permanent API errors
+    // ------------------------------------------------------------------
+
+    @Test
+    void failStep_permanentFlag_onFirstAttempt_skipsRetryAndFailsJobImmediately() {
+        // Even though attempt=0 (normally would retry), permanent=true must fail immediately.
+        Step step = stepForRoleWithAttempt(AgentRole.PLANNER, 0);
+        Job job   = jobWithId();
+        when(jobRepo.findById(any())).thenReturn(Optional.of(job));
+        when(stepRepo.save(any())).thenReturn(step);
+
+        service.failStep(step, "Claude API error 401: Unauthorized", true);
+
+        // Step must be FAILED, not PENDING
+        assertThat(step.getState()).isEqualTo(StepState.FAILED);
+        // Job must be FAILED immediately
+        ArgumentCaptor<Job> jobCaptor = ArgumentCaptor.forClass(Job.class);
+        verify(jobRepo).save(jobCaptor.capture());
+        assertThat(jobCaptor.getValue().getState()).isEqualTo(JobState.FAILED);
+        // Workspace must be cleaned up
+        verify(workspaceClient).deleteWorkspace(job.getWorkspaceRef());
+    }
+
+    @Test
+    void failStep_permanentFlag_usesCorrectMetricTag() {
+        Step step = stepForRoleWithAttempt(AgentRole.PLANNER, 0);
+        Job job   = jobWithId();
+        when(jobRepo.findById(any())).thenReturn(Optional.of(job));
+        when(stepRepo.save(any())).thenReturn(step);
+
+        service.failStep(step, "Claude API error 402: Payment Required", true);
+
+        assertThat(meterRegistry.counter("codepilot.jobs.failed", "reason", "permanent_error").count())
+                .isEqualTo(1.0);
+        // Must NOT increment max_retries counter
+        assertThat(meterRegistry.counter("codepilot.jobs.failed", "reason", "max_retries").count())
+                .isEqualTo(0.0);
     }
 
     // ------------------------------------------------------------------

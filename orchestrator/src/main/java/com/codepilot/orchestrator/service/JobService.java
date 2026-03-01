@@ -153,6 +153,11 @@ public class JobService {
      */
     @Transactional
     public void completeStep(Step step, String resultJson) {
+        // Guard against ghost threads: after the watchdog recovers a stalled step,
+        // the original worker may still be alive and call completeStep after losing
+        // ownership. Verify this worker still owns the step before acting.
+        if (!ownsStep(step)) return;
+
         step.setState(StepState.DONE);
         step.setFinishedAt(Instant.now());
         step.setResultJson(resultJson);
@@ -220,12 +225,29 @@ public class JobService {
      */
     @Transactional
     public void failStep(Step step, String reason) {
+        failStep(step, reason, false);
+    }
+
+    /**
+     * Mark a step as FAILED, with optional permanent flag.
+     *
+     * @param permanent if true, skip all remaining retry attempts and fail the
+     *                  job immediately. Use this for errors that retrying cannot
+     *                  fix (e.g. 401 Unauthorized, 402 Payment Required, 400 Bad Request).
+     */
+    @Transactional
+    public void failStep(Step step, String reason, boolean permanent) {
+        // Guard against ghost threads (same rationale as completeStep).
+        if (!ownsStep(step)) return;
+
         final int MAX_ATTEMPTS = 3;
         step.incrementAttempt();
         step.setFinishedAt(Instant.now());
         step.setWorkerId(null);
 
-        if (step.getAttempt() < MAX_ATTEMPTS) {
+        boolean shouldRetry = !permanent && step.getAttempt() < MAX_ATTEMPTS;
+
+        if (shouldRetry) {
             step.setState(StepState.PENDING);   // will be claimed again by scheduler
             step.setStartedAt(null);
             step.setFinishedAt(null);
@@ -239,12 +261,17 @@ public class JobService {
             Job job = jobRepo.findById(step.getJob().getId()).orElseThrow();
             job.setState(JobState.FAILED);
             jobRepo.save(job);
-            log.error("Step {} permanently failed after {} attempts. Job {} → FAILED.",
-                    step.getId(), MAX_ATTEMPTS, job.getId());
+            if (permanent) {
+                log.error("Step {} failed with a permanent error — no retry. Job {} → FAILED. Reason: {}",
+                        step.getId(), job.getId(), reason);
+                meterRegistry.counter("codepilot.jobs.failed", "reason", "permanent_error").increment();
+            } else {
+                log.error("Step {} permanently failed after {} attempts. Job {} → FAILED.",
+                        step.getId(), MAX_ATTEMPTS, job.getId());
+                meterRegistry.counter("codepilot.jobs.failed", "reason", "max_retries").increment();
+            }
             meterRegistry.counter("codepilot.steps.failed",
                     "role", step.getRole().name()).increment();
-            meterRegistry.counter("codepilot.jobs.failed",
-                    "reason", "max_retries").increment();
             cleanupWorkspace(job);
         }
         stepRepo.save(step);
@@ -376,6 +403,37 @@ public class JobService {
             log.warn("Could not restore snapshot '{}' for job {} — PLANNER will see modified files: {}",
                     key, job.getId(), e.getMessage());
         }
+    }
+
+    /**
+     * Verify that the calling worker still owns this step in the DB.
+     *
+     * When the watchdog marks a stalled step for retry, the original worker thread
+     * may still be alive. Once another worker claims the step (or it completes), the
+     * original thread must not interfere. We detect this by comparing the in-memory
+     * workerId (set when the step was originally claimed) against the current DB value.
+     *
+     * Returns false (and logs a warning) if ownership has been lost; the caller
+     * should then silently return without modifying any state.
+     */
+    private boolean ownsStep(Step step) {
+        // Steps created internally (e.g. by recoverStalledSteps) always have a workerId.
+        // If workerId is null the step was never claimed — treat it as owned.
+        if (step.getWorkerId() == null) return true;
+
+        Step fresh = stepRepo.findById(step.getId()).orElse(null);
+        if (fresh == null) {
+            log.warn("Step {} no longer exists in DB — ignoring call from worker {}",
+                    step.getId(), step.getWorkerId());
+            return false;
+        }
+        if (fresh.getState() != StepState.RUNNING
+                || !step.getWorkerId().equals(fresh.getWorkerId())) {
+            log.warn("Step {} ownership lost — caller workerId={}, DB workerId={}, DB state={} — ignoring",
+                    step.getId(), step.getWorkerId(), fresh.getWorkerId(), fresh.getState());
+            return false;
+        }
+        return true;
     }
 
     private static AgentRole nextRole(AgentRole current) {
