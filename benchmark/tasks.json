@@ -66,6 +66,23 @@
       "difficulty": "easy"
     },
     {
+      "id": "LANG-1814",
+      "project": "commons-lang",
+      "repo_url": "https://github.com/yvie97/commons-lang.git",
+      "git_ref": "93f53a58604264ae105e2327a2b8713b84b296bb",
+      "description": "ArrayUtils.subarray() overflows when extreme index values (Integer.MAX_VALUE / Integer.MIN_VALUE) are passed: the expression endIndexExclusive - startIndexInclusive wraps to a negative number, causing the method to return an empty array instead of the correct subarray. Fix by wrapping the endIndexExclusive assignment with max0() in all 9 primitive and Object overloads.",
+      "affected_file": "src/main/java/org/apache/commons/lang3/ArrayUtils.java",
+      "affected_method": "subarray (9 overloads: boolean, byte, char, double, float, int, long, short, Object)",
+      "failing_test": "ArrayUtilsTest#testSubarrayInt+testSubarrayObject+testSubarrayBoolean+testSubarrayByte",
+      "test_command": ["mvn", "-q", "test", "-Dtest=ArrayUtilsTest#testSubarrayInt+testSubarrayObject+testSubarrayBoolean+testSubarrayByte"],
+      "bug_category": "boundary",
+      "difficulty": "medium",
+      "jira": "LANG-1814",
+      "upstream_repo": "https://github.com/apache/commons-lang.git",
+      "upstream_fix_commit": "26ead6134ad55bf1350e41f05f4d0cbe6d0be4be",
+      "note": "Agent must fix all 9 overloads — missing any one causes the corresponding test to fail."
+    },
+    {
       "id": "LANG-1804",
       "project": "commons-lang",
       "repo_url": "https://github.com/yvie97/commons-lang.git",
