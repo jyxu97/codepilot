@@ -52,6 +52,8 @@ services:
       CODEPILOT_EXECUTOR_BASE_URL: http://executor:8001
       # Pass the Claude API key from the host shell environment
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      # Model override: set in .env to switch without rebuilding
+      CODEPILOT_CLAUDE_MODEL: ${CODEPILOT_CLAUDE_MODEL:-claude-sonnet-4-6}
     depends_on:
       postgres:
         condition: service_healthy

@@ -55,7 +55,7 @@ public class AgentLoop {
     // over 20 turns that is at most ~40k tokens from observations alone.
     private static final int MAX_OBSERVATION_CHARS = 8_000;
 
-    private static final String MODEL = "claude-sonnet-4-6";
+    private final String model;
 
     private final ClaudeClient    claude;
     private final WorkspaceClient executor;
@@ -69,12 +69,15 @@ public class AgentLoop {
                      WorkspaceClient executor,
                      JobService jobService,
                      ObjectMapper objectMapper,
-                     SystemPrompts systemPrompts) {
+                     SystemPrompts systemPrompts,
+                     @org.springframework.beans.factory.annotation.Value("${codepilot.claude.model}") String model) {
         this.claude        = claude;
         this.executor      = executor;
         this.jobService    = jobService;
         this.objectMapper  = objectMapper;
         this.systemPrompts = systemPrompts;
+        this.model         = model;
+        log.info("Using Claude model: {}", model);
     }
 
     // ------------------------------------------------------------------
@@ -120,27 +123,59 @@ public class AgentLoop {
         List<Message> history = loadOrInitHistory(step, priorResults);
 
         // Multi-turn loop
+        int consecutiveTimeouts = 0;
         for (int turn = 1; turn <= MAX_TURNS; turn++) {
             log.debug("Turn {}/{} for step {}", turn, MAX_TURNS, step.getId());
 
             // --- Call Claude ---
             String response;
             try {
-                response = claude.complete(MODEL, history, systemPrompts.get(step.getRole()));
+                response = claude.complete(model, history, systemPrompts.get(step.getRole()));
+                consecutiveTimeouts = 0;   // reset on any successful response
             } catch (ClaudeClient.ClaudeApiException e) {
-                if (e.statusCode() == 429) {
-                    log.warn("Rate-limited by Claude API (turn {}/{}), backing off 60 s before retry…",
-                            turn, MAX_TURNS);
-                    try { Thread.sleep(60_000); } catch (InterruptedException ie) {
-                        Thread.currentThread().interrupt();
+                switch (e.errorKind()) {
+                    case TRANSIENT_BACKOFF -> {
+                        // 429 rate-limit or 529 overloaded — wait and retry the same turn.
+                        log.warn("Claude API transient error (status={}, turn={}/{}), backing off 60 s…",
+                                e.statusCode(), turn, MAX_TURNS);
+                        // Update heartbeat BEFORE sleeping so the watchdog does not
+                        // mistake a legitimate rate-limit backoff for a crashed worker.
+                        jobService.heartbeat(step);
+                        sleepSeconds(60);
+                        turn--;
+                        continue;
                     }
-                    turn--;   // don't consume a turn for a transient rate-limit error
-                    continue;
+                    case TRANSIENT_TIMEOUT -> {
+                        // Network timeout — allow one retry before giving up.
+                        consecutiveTimeouts++;
+                        log.warn("Claude API request timed out (consecutive={}, turn={}/{}). {}",
+                                consecutiveTimeouts, turn, MAX_TURNS,
+                                consecutiveTimeouts >= 2 ? "Failing step." : "Retrying once…");
+                        if (consecutiveTimeouts >= 2) {
+                            jobService.failStep(step, e.getMessage());
+                            return;
+                        }
+                        jobService.heartbeat(step);  // same rationale as TRANSIENT_BACKOFF
+                        turn--;   // don't consume a turn for a single timeout
+                        continue;
+                    }
+                    case PERMANENT -> {
+                        // 401/402/403/400 — retrying will never help; fail immediately.
+                        log.error("Permanent Claude API error (status={}) — will not retry: {}",
+                                e.statusCode(), e.getMessage());
+                        jobService.failStep(step, e.getMessage(), true);
+                        return;
+                    }
                 }
-                jobService.failStep(step, "Claude API error: " + e.getMessage());
-                return;
+                return; // unreachable but keeps the compiler happy
             } catch (Exception e) {
-                jobService.failStep(step, "Claude API error: " + e.getMessage());
+                // Unexpected non-API exception (e.g. serialisation error).
+                // Log with full cause chain to make future diagnosis easy.
+                log.warn("Unexpected exception calling Claude (turn={}/{}): {} — cause: {}",
+                        turn, MAX_TURNS, e.getMessage(),
+                        e.getCause() != null ? e.getCause().toString() : "none");
+                jobService.failStep(step, "Claude API error: " + e.getMessage()
+                        + (e.getCause() != null ? " (caused by: " + e.getCause().getClass().getSimpleName() + ")" : ""));
                 return;
             }
             history.add(new Message("assistant", response));
@@ -237,6 +272,15 @@ public class AgentLoop {
         }
     }
 
+    /** Sleep for {@code seconds} seconds, swallowing interrupts cleanly. */
+    private static void sleepSeconds(int seconds) {
+        try {
+            Thread.sleep(seconds * 1_000L);
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
     /**
      * Execute a Python code block in the sandbox and return the observation string.
      * The observation is what Claude reads on its next turn.
@@ -305,8 +349,9 @@ public class AgentLoop {
         StringBuilder sb = new StringBuilder();
         sb.append("You are starting your task as the ").append(role).append(" agent.\n\n");
 
-        // Inject task context for the agents that need it most.
-        if ((role == AgentRole.REPO_MAPPER || role == AgentRole.PLANNER)
+        // Inject task context for agents that need it.
+        if ((role == AgentRole.REPO_MAPPER || role == AgentRole.PLANNER
+                || role == AgentRole.IMPLEMENTER || role == AgentRole.TESTER)
                 && (taskDescription != null || failingTest != null)) {
             sb.append("=== TASK CONTEXT ===\n");
             if (taskDescription != null) {
@@ -344,10 +389,22 @@ public class AgentLoop {
                 yield "Using the repository map and task context above, analyse the codebase " +
                       "and produce a repair plan targeting the described bug.";
             }
-            case IMPLEMENTER ->
-                "Follow the repair plan above. Apply the changes using apply_patch() and verify.";
-            case TESTER ->
-                "Run the test suite with run_command([\"mvn\", \"-q\", \"test\"]) and report results.";
+            case IMPLEMENTER -> {
+                if (failingTest != null && !failingTest.isBlank()) {
+                    yield "Follow the repair plan above. Apply the changes using apply_patch() and verify. " +
+                          "IMPORTANT: After applying the fix, run the failing test from the task context " +
+                          "to confirm your fix works. If it still fails, revise and retry.";
+                }
+                yield "Follow the repair plan above. Apply the changes using apply_patch() and verify.";
+            }
+            case TESTER -> {
+                if (failingTest != null && !failingTest.isBlank()) {
+                    yield "Run ONLY the specific failing test from the task context using " +
+                          "`run_command([\"mvn\", \"-q\", \"test\", \"-Dtest=<test-name>\"])`. " +
+                          "Do NOT run the full test suite. Report the result immediately.";
+                }
+                yield "Run the full test suite with run_command([\"mvn\", \"-q\", \"test\"]) and report results.";
+            }
             case REVIEWER ->
                 "Review the repair. Run git_diff(\"HEAD\") and assess the changes.";
             case FINALIZER ->
