@@ -23,7 +23,7 @@ WORKDIR /app
 COPY --from=build /app/target/*.jar app.jar
 
 # Run as a non-root user for security
-RUN addgroup -S orchestrator && adduser -S orchestrator -G orchestrator
+RUN addgroup -S orchestrator && adduser -S -u 1001 orchestrator -G orchestrator
 USER orchestrator
 
 EXPOSE 8080

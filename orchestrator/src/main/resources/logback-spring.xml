@@ -31,13 +31,8 @@
                 <includeMdcKeyName>stepId</includeMdcKeyName>
                 <includeMdcKeyName>role</includeMdcKeyName>
                 <includeMdcKeyName>attempt</includeMdcKeyName>
-                <!-- Include the application name tag set in application.properties -->
-                <providers>
-                    <mdc/>
-                    <arguments/>
-                    <logstashMarkers/>
-                    <stackTrace/>
-                </providers>
+                <!-- Default providers (mdc, arguments, logstashMarkers, stackTrace)
+                     are included automatically by LogstashEncoder -->
             </encoder>
         </appender>
 

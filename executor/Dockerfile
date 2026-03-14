@@ -23,7 +23,7 @@ COPY . .
 
 # Create a non-root user WITH a home directory so Maven can persist
 # downloaded artifacts to ~/.m2 between agent turns within one container run.
-RUN useradd --system --create-home --shell /bin/sh executor \
+RUN useradd --system --uid 1000 --create-home --shell /bin/sh executor \
     && mkdir -p /home/executor/.m2 \
     && chown -R executor:executor /home/executor/.m2
 USER executor

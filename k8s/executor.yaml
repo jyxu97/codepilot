@@ -29,6 +29,11 @@ spec:
           imagePullPolicy: IfNotPresent   # use local image in dev; set to Always in CI
           ports:
             - containerPort: 8001
+          volumeMounts:
+            - name: maven-cache
+              mountPath: /home/executor/.m2
+            - name: workspaces
+              mountPath: /tmp/codepilot-workspaces
           resources:
             requests:
               cpu:    "250m"
@@ -49,6 +54,24 @@ spec:
             initialDelaySeconds: 15
             periodSeconds: 30
             failureThreshold: 3
+      volumes:
+        - name: maven-cache
+          persistentVolumeClaim:
+            claimName: maven-cache
+        - name: workspaces
+          emptyDir: {}        # ephemeral per-pod; matches docker-compose tmpfs
+---
+# PVC for Maven local repo — persists downloaded JARs across pod restarts.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: maven-cache
+  namespace: codepilot
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 1Gi
 ---
 # ClusterIP Service — only the orchestrator talks to the executor.
 # Not exposed outside the cluster.

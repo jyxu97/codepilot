@@ -14,5 +14,7 @@ data:
   CODEPILOT_EXECUTOR_BASE_URL: "http://executor:8001"
   # Suppress Hibernate schema validation warnings in logs
   SPRING_JPA_OPEN_IN_VIEW:   "false"
+  # Claude model — override to switch without rebuilding images
+  CODEPILOT_CLAUDE_MODEL:    "claude-sonnet-4-6"
   # Activate the prod Spring profile → enables JSON logging (logback-spring.xml)
   SPRING_PROFILES_ACTIVE:    "prod"
