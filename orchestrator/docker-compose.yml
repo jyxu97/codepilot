@@ -6,7 +6,7 @@ services:
     environment:
       POSTGRES_DB:       codepilot
       POSTGRES_USER:     codepilot
-      POSTGRES_PASSWORD: codepilot
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-codepilot-dev}
     ports:
       - "5432:5432"          # expose for local psql / debugging
     volumes:
@@ -48,7 +48,7 @@ services:
       # Override application.properties to use Docker service hostnames
       SPRING_DATASOURCE_URL:      jdbc:postgresql://postgres:5432/codepilot
       SPRING_DATASOURCE_USERNAME: codepilot
-      SPRING_DATASOURCE_PASSWORD: codepilot
+      SPRING_DATASOURCE_PASSWORD: ${DB_PASSWORD:-codepilot-dev}
       CODEPILOT_EXECUTOR_BASE_URL: http://executor:8001
       # Pass the Claude API key from the host shell environment
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
